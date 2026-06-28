@@ -1,0 +1,1857 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Simulation Research Terminal</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d9488'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-family='monospace' font-weight='bold' font-size='15' fill='white'%3ESL%3C/text%3E%3C/svg%3E">
+
+  <!-- React 18 UMD -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel (JSX in browser) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- D3.js v7 -->
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <!-- PDF.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <!-- PptxGenJS -->
+  <script src="https://cdn.jsdelivr.net/npm/pptxgenjs/dist/pptxgen.bundle.js"></script>
+
+  <!-- Tailwind custom theme -->
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary:   '#0d9488',
+            'primary-dark': '#0f766e',
+            'primary-light': '#f0fdfa',
+            sidebar:   '#0f1f1c',
+            'sidebar-card': '#1a2e2b',
+            'sidebar-border': '#2d4a45',
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Print CSS (used by PDF export via window.print) -->
+  <style>
+    @media print {
+      body > * { display: none !important; }
+      #print-area { display: block !important; }
+    }
+    #print-area { display: none; }
+    @media print { .no-print { display: none !important; } }
+
+    /* Custom scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #f1f5f9; }
+    ::-webkit-scrollbar-thumb { background: #0d9488; border-radius: 3px; }
+
+    /* D3 tooltip */
+    .d3-tooltip {
+      position: absolute;
+      background: #0f1f1c;
+      color: #f0fdfa;
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.2s;
+      max-width: 200px;
+      z-index: 50;
+    }
+
+    /* Chat slide-up animation */
+    @keyframes slideUp {
+      from { transform: translateY(100%); opacity: 0; }
+      to   { transform: translateY(0);   opacity: 1; }
+    }
+    .chat-panel { animation: slideUp 0.2s ease-out; }
+
+    @keyframes fadeIn { from { opacity: 0; transform: translateX(-50%) translateY(8px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
+    .animate-fade-in { animation: fadeIn 0.2s ease-out; }
+
+    /* Chat markdown */
+    .chat-md { word-break: break-word; overflow-wrap: break-word; }
+    .chat-md ul { list-style: disc; padding-left: 1.1rem; margin: 0.3rem 0; }
+    .chat-md li { margin-bottom: 0.2rem; }
+    .chat-md p { margin-bottom: 0.4rem; }
+    .chat-md p:last-child { margin-bottom: 0; }
+    .chat-md strong { font-weight: 600; color: #5eead4; }
+    .chat-md .cite { font-size: 0.65rem; opacity: 0.55; word-break: break-all; }
+  </style>
+</head>
+<body class="bg-gray-50 font-sans">
+  <div id="root"></div>
+  <div id="print-area"></div>
+
+  <script>
+    // Register Babel preset-react with classic runtime so React.createElement is used
+    Babel.registerPreset('react-classic', {
+      presets: [[Babel.availablePresets['react'], { runtime: 'classic' }]]
+    });
+  </script>
+  <script type="text/babel" data-presets="react-classic">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // ── CONSTANTS ──────────────────────────────────────────
+    const MAX_DOCS = 5; // ← change this to increase document limit
+    const GEMINI_MODEL = 'gemini-2.5-flash';
+    const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+    const TEXT_LIMIT = 8000;
+
+    // ── PDF / TEXT EXTRACTION ────────────────────────────────
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+    async function extractTextFromPDF(arrayBuffer) {
+      // Save a copy before PDF.js potentially transfers/detaches the buffer
+      const pdfDataBackup = arrayBuffer.slice(0);
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      let fullText = '';
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page    = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        const pageText = content.items.map(item => item.str).join(' ');
+        fullText += `\n\n--- Page ${i} ---\n${pageText}`;
+      }
+      return { text: fullText.trim(), numPages: pdf.numPages, pdfData: pdfDataBackup };
+    }
+
+    async function extractTextFromFile(file) {
+      const name = file.name.toLowerCase();
+      if (name.endsWith('.pdf')) {
+        const buffer = await file.arrayBuffer();
+        return extractTextFromPDF(buffer);
+      }
+      const text  = await file.text();
+      const lines = text.split('\n').length;
+      return { text, numPages: Math.max(1, Math.ceil(lines / 40)), pdfData: null };
+    }
+
+    function generateId() {
+      return Math.random().toString(36).slice(2, 10);
+    }
+
+    function arrayBufferToBase64(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary);
+    }
+
+    function base64ToArrayBuffer(b64) {
+      const binary = atob(b64);
+      const buffer = new ArrayBuffer(binary.length);
+      const bytes  = new Uint8Array(buffer);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return buffer;
+    }
+
+    // ── INDEXEDDB — PDF binary storage (no size limit) ──────────
+    const IDB_NAME  = 'simlens_db';
+    const IDB_STORE = 'pdf_binaries';
+
+    function openIdb() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(IDB_NAME, 1);
+        req.onupgradeneeded = e => e.target.result.createObjectStore(IDB_STORE);
+        req.onsuccess = e => resolve(e.target.result);
+        req.onerror   = () => reject(req.error);
+      });
+    }
+
+    async function idbSavePdf(id, buffer) {
+      try {
+        const db = await openIdb();
+        await new Promise((res, rej) => {
+          const tx = db.transaction(IDB_STORE, 'readwrite');
+          tx.objectStore(IDB_STORE).put(buffer, id);
+          tx.oncomplete = res;
+          tx.onerror    = () => rej(tx.error);
+        });
+        db.close();
+      } catch {}
+    }
+
+    async function idbLoadPdf(id) {
+      try {
+        const db  = await openIdb();
+        const buf = await new Promise((res, rej) => {
+          const tx  = db.transaction(IDB_STORE, 'readonly');
+          const req = tx.objectStore(IDB_STORE).get(id);
+          req.onsuccess = () => res(req.result || null);
+          req.onerror   = () => rej(req.error);
+        });
+        db.close();
+        return buf;
+      } catch { return null; }
+    }
+
+    async function idbDeletePdf(id) {
+      try {
+        const db = await openIdb();
+        await new Promise((res, rej) => {
+          const tx = db.transaction(IDB_STORE, 'readwrite');
+          tx.objectStore(IDB_STORE).delete(id);
+          tx.oncomplete = res;
+          tx.onerror    = () => rej(tx.error);
+        });
+        db.close();
+      } catch {}
+    }
+
+    // ── STORAGE ──────────────────────────────────────────────────
+    function saveDocsToStorage(docs) {
+      // PDF binaries live in IndexedDB — only save text metadata here
+      try {
+        const serialized = docs.map(d => ({ ...d, pdfData: undefined, pdfDataB64: undefined }));
+        localStorage.setItem('simlens_docs', JSON.stringify(serialized));
+      } catch {
+        try {
+          const minimal = docs.map(d => ({
+            id: d.id, name: d.name, fileType: d.fileType, active: d.active,
+            numPages: d.numPages, extracted: d.extracted, text: d.text || '',
+          }));
+          localStorage.setItem('simlens_docs', JSON.stringify(minimal));
+        } catch {}
+      }
+    }
+
+    function loadDocsFromStorage() {
+      try {
+        const raw = localStorage.getItem('simlens_docs');
+        if (!raw) return [];
+        return JSON.parse(raw).map(d => {
+          // Migrate old pdfDataB64 format → IndexedDB on first load
+          let pdfData = null;
+          if (d.pdfDataB64) {
+            pdfData = base64ToArrayBuffer(d.pdfDataB64);
+            idbSavePdf(d.id, pdfData).catch(() => {}); // migrate to IndexedDB
+          }
+          return {
+            ...d,
+            pdfData,
+            pdfDataB64: undefined,
+            extracted: d.extracted === false ? null : d.extracted,
+          };
+        });
+      } catch { return []; }
+    }
+
+    // ── UTILITIES ──────────────────────────────────────────────
+    async function callGemini(prompt, apiKey, retries = 2) {
+      if (!apiKey) throw new Error('No API key set');
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        const res = await fetch(`${GEMINI_ENDPOINT}?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
+          }),
+        });
+        if ((res.status === 503 || res.status === 429) && attempt < retries) {
+          await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+          continue;
+        }
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(formatApiError(err.error?.message || `HTTP ${res.status}`));
+        }
+        const data = await res.json();
+        return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      }
+    }
+
+    function formatApiError(msg) {
+      if (!msg) return 'Unknown error';
+      // Quota exceeded — extract retry seconds
+      const retryMatch = msg.match(/retry in ([\d.]+)s/i);
+      if (msg.includes('quota') || msg.includes('RESOURCE_EXHAUSTED')) {
+        const secs = retryMatch ? Math.ceil(parseFloat(retryMatch[1])) : null;
+        return `API quota reached (free tier: 20 req/min).${secs ? ` Retry in ~${secs}s.` : ' Please wait a moment.'}`;
+      }
+      // High demand / overloaded
+      if (msg.includes('high demand') || msg.includes('overloaded') || msg.includes('503')) {
+        return 'Gemini is busy right now. Retrying automatically…';
+      }
+      // Generic — trim URLs and cap length
+      return msg.replace(/https?:\/\/\S+/g, '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    }
+
+    function renderMarkdown(text) {
+      if (!text) return '';
+      const html = text
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.*?)\*/g, '<em>$1</em>')
+        // citation references [Filename, p.N] — shrink them
+        .replace(/\[([^\]]{20,})\]/g, (_, c) => `<span class="cite">[${c}]</span>`)
+        // bullet lines: * text or - text or numbered 1. text
+        .split('\n')
+        .map(line => {
+          const bullet = line.match(/^[\*\-]\s+(.*)/);
+          const numbered = line.match(/^\d+\.\s+(.*)/);
+          if (bullet)   return `<li>${bullet[1]}</li>`;
+          if (numbered) return `<li>${numbered[1]}</li>`;
+          return line;
+        })
+        .join('\n')
+        // wrap consecutive <li> runs in <ul>
+        .replace(/((<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>')
+        // paragraphs
+        .split(/\n{2,}/)
+        .map(block => block.trim() ? (block.startsWith('<ul>') ? block : `<p>${block.replace(/\n/g, '<br/>')}</p>`) : '')
+        .join('');
+      return html;
+    }
+
+    function parseGeminiJSON(text) {
+      const stripped = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+      const match = stripped.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+      if (!match) throw new Error('No JSON found in response');
+      return JSON.parse(match[0]);
+    }
+
+    async function renderPDFPageAsImage(pdfData, pageNum, scale = 1.5) {
+  if (!pdfData || pdfData.byteLength === 0) return null;
+  try {
+    const copy     = pdfData.slice(0);
+    const pdf      = await pdfjsLib.getDocument({ data: copy }).promise;
+    const page     = await pdf.getPage(Math.min(pageNum, pdf.numPages));
+    const viewport = page.getViewport({ scale });
+    const canvas   = document.createElement('canvas');
+    canvas.width   = viewport.width;
+    canvas.height  = viewport.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    return canvas.toDataURL('image/png');
+  } catch { return null; }
+}
+
+    async function exportSVGasPNG(svgEl) {
+      if (!svgEl) return;
+      const serializer = new XMLSerializer();
+      const svgStr  = serializer.serializeToString(svgEl);
+      const blob    = new Blob([svgStr], { type: 'image/svg+xml' });
+      const url     = URL.createObjectURL(blob);
+      const img     = new Image();
+      img.onload = () => {
+        const canvas  = document.createElement('canvas');
+        canvas.width  = svgEl.clientWidth  || 800;
+        canvas.height = svgEl.clientHeight || 500;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+        const a = document.createElement('a');
+        a.href     = canvas.toDataURL('image/png');
+        a.download = 'simlens-neural-map.png';
+        a.click();
+      };
+      img.src = url;
+    }
+
+    async function exportToPptx(slidesData) {
+      // slidesData: [{ slide, doc }]
+      if (!slidesData || slidesData.length === 0) return;
+      const pptx = new PptxGenJS();
+      pptx.layout = 'LAYOUT_16x9';
+      slidesData.forEach(({ slide, doc }, i) => {
+        if (!slide) return;
+        const s = pptx.addSlide();
+        s.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: '100%', h: 1.0, fill: { color: '0f1f1c' } });
+        s.addText(slide.title || `Slide ${i + 1}`, { x: 0.3, y: 0.1, w: 9.1, h: 0.8, fontSize: 22, bold: true, color: 'FFFFFF' });
+        let y = 1.15;
+        if (slide.objective) {
+          s.addText('OBJECTIVE', { x: 0.3, y, w: 6, h: 0.28, fontSize: 9, bold: true, color: '1d4ed8' }); y += 0.28;
+          s.addText(slide.objective, { x: 0.3, y, w: 6, h: 0.75, fontSize: 10, color: '374151', wrap: true }); y += 0.85;
+        }
+        if (slide.solution) {
+          s.addText('SOLUTION / APPROACH', { x: 0.3, y, w: 6, h: 0.28, fontSize: 9, bold: true, color: '1d4ed8' }); y += 0.28;
+          s.addText(slide.solution, { x: 0.3, y, w: 6, h: 0.75, fontSize: 10, color: '374151', wrap: true }); y += 0.85;
+        }
+        if (slide.benefits?.length > 0) {
+          s.addText('KEY FINDINGS', { x: 0.3, y, w: 6, h: 0.28, fontSize: 9, bold: true, color: '1d4ed8' }); y += 0.28;
+          slide.benefits.slice(0, 4).forEach((b, bi) => {
+            s.addText(`• ${b}`, { x: 0.3, y: y + bi * 0.32, w: 6, h: 0.32, fontSize: 9, color: '374151', wrap: true });
+          });
+        }
+        const pptTitle   = doc?.extracted?.title || doc?.name || '';
+        const pptAuthors = doc?.extracted?.authors?.length ? doc.extracted.authors.join(' · ') : '';
+        s.addText(pptAuthors ? `${pptTitle}  —  ${pptAuthors}` : pptTitle, { x: 0.3, y: 6.9, w: 7.5, h: 0.22, fontSize: 7, color: '9ca3af' });
+        s.addText(`${i + 1} / ${slidesData.length}`, { x: 8.5, y: 6.9, w: 1, h: 0.22, fontSize: 7, color: '9ca3af', align: 'right' });
+      });
+      await pptx.writeFile({ fileName: 'simlens-slides.pptx' });
+    }
+
+    async function runAutoExtraction(doc, apiKey) {
+      if (!doc.text?.trim()) throw new Error('Document has no extractable text');
+      const prompt = `You are SimLens AI. Analyze this technical document and extract the following. Return ONLY valid JSON with no markdown wrapping.
+
+Document name: ${doc.name}
+Content: ${doc.text.slice(0, TEXT_LIMIT)}
+
+Return this exact JSON structure:
+{
+  "title": "full title of the paper or document",
+  "authors": ["Author Name 1", "Author Name 2"],
+  "summary": "what this document is about in 2-3 sentences",
+  "tools": ["tool1", "tool2"],
+  "topics": ["topic1", "topic2"],
+  "references": ["ref1", "ref2"],
+  "conclusions": ["conclusion1", "conclusion2", "conclusion3"]
+}`;
+      const raw = await callGemini(prompt, apiKey);
+      return parseGeminiJSON(raw);
+    }
+
+    // ── NODE COLORS for Neural Map ───────────────────────────────
+    const NODE_COLORS = {
+      concept:   '#0d9488',
+      process:   '#2563eb',
+      input:     '#ea580c',
+      output:    '#16a34a',
+      parameter: '#ca8a04',
+      result:    '#9333ea',
+    };
+
+    // ── EXPORT BUTTON ─────────────────────────────────────────
+    function ExportButton({ activeTab, selectedDoc, neuralSvgEl, activeDocs, slidesCache, compareData, exportOpen, setExportOpen, showToast }) {
+      const ref = useRef(null);
+
+      // Close dropdown on outside click
+      useEffect(() => {
+        if (!exportOpen) return;
+        const handler = e => { if (ref.current && !ref.current.contains(e.target)) setExportOpen(false); };
+        document.addEventListener('mousedown', handler);
+        return () => document.removeEventListener('mousedown', handler);
+      }, [exportOpen]);
+
+      const copyLensText = () => {
+        if (!selectedDoc) { showToast && showToast('No document selected.'); return; }
+        navigator.clipboard.writeText(selectedDoc.text).then(
+          () => showToast && showToast('Document text copied!'),
+          () => showToast && showToast('Copy failed — try again')
+        );
+      };
+
+      const printPage = () => {
+        setExportOpen(false);
+        // Find the main content area and clone it into print-area
+        const mainEl = document.querySelector('main');
+        const printArea = document.getElementById('print-area');
+        if (mainEl && printArea) {
+          printArea.innerHTML = mainEl.innerHTML;
+        }
+        window.print();
+        // Clean up after printing
+        setTimeout(() => {
+          if (printArea) printArea.innerHTML = '';
+        }, 2000);
+      };
+
+      if (activeTab === 'lens') {
+        return (
+          <button
+            onClick={copyLensText}
+            className="px-3 py-1.5 text-xs rounded bg-primary-light text-primary border border-primary/30 hover:bg-primary hover:text-white transition-colors"
+          >📋 Copy</button>
+        );
+      }
+
+      if (activeTab === 'compare') {
+        return (
+          <button
+            onClick={printPage}
+            className="px-3 py-1.5 text-xs rounded bg-primary-light text-primary border border-primary/30 hover:bg-primary hover:text-white transition-colors"
+          >📄 Export PDF</button>
+        );
+      }
+
+      if (activeTab === 'neural') {
+        return (
+          <div className="relative" ref={ref}>
+            <button
+              onClick={() => setExportOpen(o => !o)}
+              className="px-3 py-1.5 text-xs rounded bg-primary-light text-primary border border-primary/30 hover:bg-primary hover:text-white transition-colors"
+            >⬇ Export ▾</button>
+            {exportOpen && (
+              <div className="absolute right-0 top-full mt-1 bg-white rounded-lg shadow-xl border border-gray-200 min-w-40 z-50 overflow-hidden">
+                <button
+                  onClick={() => { setExportOpen(false); if (!neuralSvgEl) { showToast && showToast('Generate the map first.'); return; } exportSVGasPNG(neuralSvgEl); }}
+                  className="block w-full text-left px-4 py-2.5 text-sm hover:bg-gray-50 transition-colors"
+                >🖼 Save as PNG</button>
+                <button
+                  onClick={printPage}
+                  className="block w-full text-left px-4 py-2.5 text-sm hover:bg-gray-50 transition-colors border-t border-gray-100"
+                >📄 Export as PDF</button>
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      if (activeTab === 'slides') {
+        return (
+          <div className="relative" ref={ref}>
+            <button
+              onClick={() => setExportOpen(o => !o)}
+              className="px-3 py-1.5 text-xs rounded bg-primary-light text-primary border border-primary/30 hover:bg-primary hover:text-white transition-colors"
+            >⬇ Export ▾</button>
+            {exportOpen && (
+              <div className="absolute right-0 top-full mt-1 bg-white rounded-lg shadow-xl border border-gray-200 min-w-44 z-50 overflow-hidden">
+                <button
+                  onClick={() => {
+                    setExportOpen(false);
+                    const data = (activeDocs || []).map(d => ({ slide: slidesCache?.[d.id]?.slide, doc: d })).filter(x => x.slide);
+                    if (data.length === 0) { showToast && showToast('Generate slides first.'); return; }
+                    exportToPptx(data);
+                  }}
+                  className="block w-full text-left px-4 py-2.5 text-sm hover:bg-gray-50 transition-colors"
+                >📊 Download .pptx</button>
+                <button
+                  onClick={printPage}
+                  className="block w-full text-left px-4 py-2.5 text-sm hover:bg-gray-50 transition-colors border-t border-gray-100"
+                >📄 Export as PDF</button>
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      return null;
+    }
+
+    // ── API KEY PILL ──────────────────────────────────────────
+    function ApiKeyPill({ apiKey, onSave }) {
+      const [open, setOpen]   = useState(false);
+      const [draft, setDraft] = useState(apiKey);
+      const connected = apiKey.length > 10;
+
+      return (
+        <div className="relative">
+          <button
+            onClick={() => setOpen(o => !o)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded border text-sm transition-colors ${
+              connected
+                ? 'border-green-600 text-green-400 hover:border-green-400'
+                : 'border-red-700 text-red-400 hover:border-red-500'
+            }`}
+          >
+            <span className={`w-2 h-2 rounded-full ${connected ? 'bg-green-400' : 'bg-red-500'}`}></span>
+            {connected ? '🟢 Connected' : '🔴 API Key Missing'}
+          </button>
+
+          {open && (
+            <div className="absolute right-0 top-full mt-1 z-50 bg-gray-900 border border-sidebar-border rounded-lg p-3 shadow-xl w-80">
+              <p className="text-xs text-gray-400 mb-2">Enter your Gemini API key:</p>
+              <input
+                type="password"
+                value={draft}
+                onChange={e => setDraft(e.target.value)}
+                placeholder="AIza..."
+                className="w-full bg-sidebar-card text-gray-200 rounded px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-primary border border-sidebar-border"
+                autoFocus
+                onKeyDown={e => { if (e.key === 'Enter') { onSave(draft); setOpen(false); } }}
+              />
+              <div className="flex gap-2 mt-2">
+                <button
+                  onClick={() => { onSave(draft); setOpen(false); }}
+                  className="flex-1 bg-primary text-white text-xs py-1.5 rounded hover:bg-primary-dark"
+                >Save</button>
+                <button
+                  onClick={() => { setDraft(apiKey); setOpen(false); }}
+                  className="flex-1 bg-sidebar-card text-gray-400 text-xs py-1.5 rounded hover:bg-sidebar-border"
+                >Cancel</button>
+              </div>
+              <p className="text-xs text-gray-600 mt-2">Key stored in localStorage only. Never sent anywhere except Google's API.</p>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── LENS VIEW ─────────────────────────────────────────────
+    function LensView({ doc, apiKey, onQuickAction, onRetryExtraction }) {
+      const [page, setPage] = useState(1);
+      const [pageImage, setPageImage] = useState(null);
+      const [renderingPage, setRenderingPage] = useState(false);
+      const [viewMode, setViewMode] = useState('pdf');
+      const [pdfZoom, setPdfZoom] = useState(1.0);
+
+      useEffect(() => {
+        if (!doc?.pdfData) { setPageImage(null); setRenderingPage(false); return; }
+        let cancelled = false;
+        setRenderingPage(true);
+        setPageImage(null);
+        renderPDFPageAsImage(doc.pdfData, page).then(img => {
+          if (cancelled) return;
+          setPageImage(img);
+          setRenderingPage(false);
+        }).catch(() => {
+          if (!cancelled) setRenderingPage(false);
+        });
+        return () => { cancelled = true; };
+      }, [doc?.id, page]);
+
+      const QUICK_ACTIONS = [
+        { label: '📋 Quick Summary',   prompt: 'Give me a concise summary of this document in 5 bullet points.' },
+        { label: '🔧 Tools Used',      prompt: 'What tools, software, and methods are used in this document?' },
+        { label: '📚 Topics Covered',  prompt: 'What are the main topics and themes covered in this document?' },
+        { label: '🔗 References',      prompt: 'List the key references and citations from this document.' },
+        { label: '✅ Key Conclusions', prompt: 'What are the key conclusions and findings of this document?' },
+      ];
+
+      if (!doc) {
+        return (
+          <div className="h-full flex items-center justify-center text-gray-400">
+            <div className="text-center">
+              <div className="text-5xl mb-3">🔍</div>
+              <p className="text-gray-500">Select a document from the sidebar</p>
+            </div>
+          </div>
+        );
+      }
+
+      // Split text into pages (~50 lines each)
+      const lines      = doc.text.split('\n');
+      const perPage    = 50;
+      const totalPages = doc.pdfData ? doc.numPages : Math.max(1, Math.ceil(lines.length / perPage));
+      const pageLines  = lines.slice((page - 1) * perPage, page * perPage);
+      const pageText   = pageLines.join('\n');
+
+      return (
+        <div className="h-full flex flex-col">
+          {/* View mode toggle */}
+          <div className="flex items-center gap-2 px-4 py-2 bg-white border-b border-gray-200 flex-shrink-0">
+            <button
+              onClick={() => setViewMode('pdf')}
+              className={`px-4 py-1.5 text-sm rounded-full font-medium transition-colors ${
+                viewMode === 'pdf'
+                  ? 'bg-primary text-white'
+                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+              }`}
+            >📄 Full PDF View</button>
+            <button
+              onClick={() => setViewMode('insight')}
+              className={`px-4 py-1.5 text-sm rounded-full font-medium transition-colors ${
+                viewMode === 'insight'
+                  ? 'bg-primary text-white'
+                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+              }`}
+            >💡 Quick Insight</button>
+          </div>
+
+          {/* Content area */}
+          <div className="flex-1 overflow-auto flex flex-col items-center bg-gray-100">
+            {viewMode === 'insight' ? (
+              /* Quick Insight: 4 extraction cards */
+              <div className="w-full p-4">
+                {doc.extracted ? (
+                  <div className="grid grid-cols-2 gap-3 max-w-4xl mx-auto">
+                    {[
+                      { label: '📋 Summary',     value: doc.extracted.summary },
+                      { label: '🔧 Tools',       value: doc.extracted.tools?.join(', ') },
+                      { label: '📚 Topics',      value: doc.extracted.topics?.join(', ') },
+                      { label: '🏁 Conclusions', value: doc.extracted.conclusions?.join(' • ') },
+                    ].filter(item => item.value).map(item => (
+                      <div key={item.label} className="bg-white rounded-xl p-4 shadow-sm border border-primary/10">
+                        <div className="text-sm font-semibold text-primary mb-2">{item.label}</div>
+                        <div className="text-sm text-gray-600 leading-relaxed">{item.value}</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : doc.extracted === false ? (
+                  <div className="flex flex-col items-center justify-center h-48 gap-3">
+                    <p className="text-gray-400 text-sm">Could not extract insights</p>
+                    {onRetryExtraction && (
+                      <button
+                        onClick={() => onRetryExtraction(doc)}
+                        className="px-4 py-2 bg-primary text-white text-xs rounded-lg hover:bg-primary-dark transition-colors"
+                      >↺ Retry</button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-center h-48 text-gray-400 text-sm">
+                    {apiKey
+                      ? <div className="text-center"><div className="text-xl animate-spin mb-2">⚙</div><p>Analyzing document…</p></div>
+                      : 'Add your API key to generate insights'}
+                  </div>
+                )}
+              </div>
+            ) : (
+              /* Full PDF View — scrollable, zoomable */
+              <div className="w-full h-full overflow-auto">
+                <div className="flex justify-center p-4" style={{ minWidth: 'min-content' }}>
+                {doc.pdfData ? (
+                  renderingPage ? (
+                    <div className="flex items-center justify-center h-64 text-gray-400 w-full">
+                      <div className="text-center">
+                        <div className="text-2xl animate-spin mb-2">⚙</div>
+                        <p className="text-sm">Rendering page {page}…</p>
+                      </div>
+                    </div>
+                  ) : pageImage ? (
+                    <img
+                      src={pageImage}
+                      alt={`Page ${page}`}
+                      className="shadow-xl rounded bg-white block"
+                      style={{ width: `${Math.round(pdfZoom * 700)}px`, maxWidth: 'none' }}
+                    />
+                  ) : (
+                    <div className="text-gray-400 text-sm">Unable to render page</div>
+                  )
+                ) : (
+                  /* TXT / MD text view */
+                  <div className="w-full max-w-3xl bg-white rounded-xl shadow-sm p-6">
+                    <div className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap font-mono">
+                      {pageText}
+                    </div>
+                  </div>
+                )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Page navigation + zoom — only in Full PDF View mode */}
+          {viewMode === 'pdf' && (
+            <div className="flex items-center justify-between px-4 py-2 bg-white border-t border-gray-200 flex-shrink-0">
+              <div className="flex items-center gap-1">
+                <button onClick={() => setPdfZoom(z => Math.max(0.4, +(z - 0.2).toFixed(1)))} className="w-7 h-7 rounded bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold flex items-center justify-center">−</button>
+                <span className="text-xs text-gray-500 w-10 text-center">{Math.round(pdfZoom * 100)}%</span>
+                <button onClick={() => setPdfZoom(z => Math.min(3.0, +(z + 0.2).toFixed(1)))} className="w-7 h-7 rounded bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold flex items-center justify-center">+</button>
+                <button onClick={() => setPdfZoom(1.0)} className="ml-1 px-2 h-7 rounded bg-gray-100 hover:bg-gray-200 text-gray-500 text-xs">Fit</button>
+              </div>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setPage(p => Math.max(1, p - 1))}
+                  disabled={page === 1}
+                  className="px-3 py-1 text-sm rounded bg-gray-100 hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
+                >← Prev</button>
+                <span className="text-sm text-gray-500">Page {page} of {totalPages}</span>
+                <button
+                  onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                  disabled={page === totalPages}
+                  className="px-3 py-1 text-sm rounded bg-primary text-white hover:bg-primary-dark disabled:opacity-40 disabled:cursor-not-allowed"
+                >Next →</button>
+              </div>
+            </div>
+          )}
+
+          {/* Quick Actions — bottom of lens view */}
+          <div className="flex items-center gap-2 px-4 py-2 bg-white border-t border-gray-100 flex-shrink-0 overflow-x-auto">
+            {QUICK_ACTIONS.map(action => (
+              <button
+                key={action.label}
+                onClick={() => onQuickAction(action.prompt)}
+                disabled={!apiKey}
+                className="flex-shrink-0 px-3 py-1.5 text-xs rounded-full bg-primary-light text-primary border border-primary/20 hover:bg-primary hover:text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >{action.label}</button>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ── SLIDES ────────────────────────────────────────────────
+function Slides({ activeDocs, apiKey, slidesCache, setSlidesCache, loading, setLoading, showToast }) {
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const genRef        = useRef(0);
+  const generatingRef = useRef(false);
+
+  const safeIdx = Math.min(currentIdx, Math.max(0, activeDocs.length - 1));
+  const currentDoc = activeDocs[safeIdx] || null;
+  const cached = currentDoc ? slidesCache[currentDoc.id] : null;
+  const slide  = cached?.slide  || null;
+  const images = cached?.images || {};
+
+  const generateForDoc = useCallback(async (doc) => {
+    if (!doc || !apiKey || generatingRef.current) return;
+    generatingRef.current = true;
+    const gen = ++genRef.current;
+    setLoading('Generating slide…');
+    try {
+      const prompt = `Create ONE comprehensive presentation slide for this document.
+Return ONLY valid JSON, no markdown.
+
+Document: ${doc.name}
+Content: ${doc.text.slice(0, TEXT_LIMIT)}
+
+Return this exact JSON:
+{
+  "title": "document title (5-8 words)",
+  "objective": "What problem does this document address? (2-3 sentences)",
+  "solution": "What approach or methodology is used? (2-3 sentences)",
+  "benefits": ["key finding or benefit 1", "key finding or benefit 2", "key finding or benefit 3", "key finding or benefit 4"],
+  "figurePages": [1, 2, 3]
+}
+
+figurePages: array of 3 page numbers (1-indexed) that contain the most relevant figures or data.`;
+
+      const raw  = await callGemini(prompt, apiKey);
+      const data = parseGeminiJSON(raw);
+      if (genRef.current !== gen) return;
+      setSlidesCache(prev => ({ ...prev, [doc.id]: { slide: data, images: {} } }));
+
+      if (doc.pdfData) {
+        const pages = data.figurePages || [1, 2, 3];
+        pages.forEach((pageNum, i) => {
+          renderPDFPageAsImage(doc.pdfData, pageNum, 2.2).then(img => {
+            if (img && genRef.current === gen) {
+              setSlidesCache(prev => ({
+                ...prev,
+                [doc.id]: { ...prev[doc.id], images: { ...(prev[doc.id]?.images || {}), [i]: img } }
+              }));
+            }
+          });
+        });
+      }
+    } catch (err) {
+      showToast && showToast(err.message);
+    } finally {
+      generatingRef.current = false;
+      setLoading('');
+    }
+  }, [apiKey]);
+
+  // Auto-generate for the currently viewed doc if not yet cached
+  useEffect(() => {
+    if (currentDoc && apiKey && !slidesCache[currentDoc.id]) {
+      generateForDoc(currentDoc);
+    }
+  }, [currentDoc?.id, apiKey]);
+
+  if (activeDocs.length === 0) return (
+    <div className="h-full flex items-center justify-center text-gray-500">
+      <p>Check at least one document in the sidebar to generate slides</p>
+    </div>
+  );
+
+  if (!apiKey) return (
+    <div className="h-full flex items-center justify-center text-gray-500">
+      <p>Add your Gemini API key to generate slides</p>
+    </div>
+  );
+
+  return (
+    <div className="h-full flex flex-col">
+      {/* Toolbar */}
+      <div className="no-print flex items-center justify-between px-4 py-2 bg-white border-b border-gray-200 flex-shrink-0">
+        <span className="text-sm text-gray-500 truncate max-w-sm">{currentDoc?.name || 'Slides'}</span>
+        <button
+          onClick={() => {
+            if (!currentDoc) return;
+            generatingRef.current = false;
+            setSlidesCache(prev => { const n = { ...prev }; delete n[currentDoc.id]; return n; });
+            generateForDoc(currentDoc);
+          }}
+          disabled={!!loading}
+          className="px-3 py-1.5 bg-primary-light text-primary text-xs rounded border border-primary/30 hover:bg-primary hover:text-white transition-colors disabled:opacity-50"
+        >↺ Regenerate</button>
+      </div>
+
+      {/* Slide viewer */}
+      <div className="flex-1 overflow-hidden flex items-center justify-center p-4 bg-gray-100">
+        {loading ? (
+          <div className="text-center text-gray-400">
+            <div className="text-3xl animate-spin mb-2">⚙</div>
+            <p>{loading}</p>
+          </div>
+        ) : slide ? (
+          <div className="bg-white rounded-2xl shadow-lg w-full max-w-5xl overflow-hidden">
+            {/* Dark header */}
+            <div className="bg-sidebar px-6 py-4">
+              <div className="text-white font-bold text-xl">{slide.title}</div>
+            </div>
+            {/* Body: content left, 3 figures right */}
+            <div className="flex" style={{minHeight: '320px'}}>
+              {/* Left: Objective / Solution / Benefits — all blue, no emojis */}
+              <div className="flex-1 p-6 space-y-4 overflow-y-auto">
+                {slide.objective && (
+                  <div>
+                    <div className="text-xs font-bold text-blue-600 uppercase tracking-wide mb-1">Objective</div>
+                    <p className="text-sm text-gray-700 leading-relaxed">{slide.objective}</p>
+                  </div>
+                )}
+                {slide.solution && (
+                  <div>
+                    <div className="text-xs font-bold text-blue-600 uppercase tracking-wide mb-1">Solution / Approach</div>
+                    <p className="text-sm text-gray-700 leading-relaxed">{slide.solution}</p>
+                  </div>
+                )}
+                {slide.benefits?.length > 0 && (
+                  <div>
+                    <div className="text-xs font-bold text-blue-600 uppercase tracking-wide mb-1">Key Findings</div>
+                    <ul className="space-y-1.5">
+                      {slide.benefits.map((b, i) => (
+                        <li key={i} className="text-sm text-gray-700 flex gap-2">
+                          <span className="text-blue-500 font-bold flex-shrink-0">•</span>{b}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+              {/* Right: 3 figure images from paper */}
+              <div className="w-72 flex-shrink-0 border-l border-gray-100 p-3 bg-gray-50 flex flex-col gap-2 overflow-y-auto">
+                {currentDoc?.pdfData ? (
+                  [0, 1, 2].map(i => (
+                    <div key={i} className="flex-1 flex items-center justify-center overflow-hidden rounded border border-gray-100 bg-white">
+                      {images[i] ? (
+                        <img
+                          src={images[i]}
+                          alt={`Figure ${i + 1}`}
+                          className="w-full object-cover object-top"
+                          style={{ maxHeight: '110px' }}
+                        />
+                      ) : (
+                        <div className="text-xs text-gray-400 animate-pulse text-center p-2">Loading figure {i + 1}…</div>
+                      )}
+                    </div>
+                  ))
+                ) : (
+                  <div className="flex items-center justify-center h-full text-xs text-gray-400 text-center p-4">
+                    No figures available for this document type
+                  </div>
+                )}
+              </div>
+            </div>
+            {/* Footer */}
+            <div className="border-t border-gray-100 px-6 py-2 bg-gray-50 flex items-center justify-between">
+              <div className="flex flex-col min-w-0 max-w-lg">
+                <span className="text-xs text-gray-500 font-medium truncate">
+                  {currentDoc?.extracted?.title || currentDoc?.name}
+                </span>
+                {currentDoc?.extracted?.authors?.length > 0 && (
+                  <span className="text-xs text-gray-400 truncate">
+                    {currentDoc.extracted.authors.join(' · ')}
+                  </span>
+                )}
+              </div>
+              <span className="text-xs text-primary font-medium flex-shrink-0 ml-4">Simulation Research Terminal</span>
+            </div>
+          </div>
+        ) : (
+          <button
+            onClick={() => currentDoc && generateForDoc(currentDoc)}
+            className="px-6 py-3 bg-primary text-white rounded-lg hover:bg-primary-dark transition-colors"
+          >Generate Slides</button>
+        )}
+      </div>
+
+      {/* Multi-doc navigation */}
+      {activeDocs.length > 1 && (
+        <div className="no-print flex items-center justify-center gap-4 py-2 bg-white border-t border-gray-200 flex-shrink-0">
+          <button
+            onClick={() => setCurrentIdx(i => Math.max(0, i - 1))}
+            disabled={safeIdx === 0}
+            className="px-3 py-1 text-sm rounded bg-gray-100 hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
+          >← Prev</button>
+          <span className="text-sm text-gray-500">
+            Document {safeIdx + 1} of {activeDocs.length}
+            {slidesCache[activeDocs[safeIdx]?.id] ? '' : ' — not yet generated'}
+          </span>
+          <button
+            onClick={() => setCurrentIdx(i => Math.min(activeDocs.length - 1, i + 1))}
+            disabled={safeIdx === activeDocs.length - 1}
+            className="px-3 py-1 text-sm rounded bg-primary text-white hover:bg-primary-dark disabled:opacity-40 disabled:cursor-not-allowed"
+          >Next →</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+    // ── COMPARE ───────────────────────────────────────────────
+function Compare({ activeDocs, apiKey, compareData, setCompareData, loading, setLoading, showToast }) {
+  const [goal, setGoal] = useState('');
+
+  const generate = useCallback(async () => {
+    if (activeDocs.length < 2 || !apiKey) return;
+    setLoading('Comparing documents…');
+    try {
+      const docsPayload = activeDocs.map((d, i) =>
+        `Document ${i + 1} — "${d.name}":\n${d.text.slice(0, Math.floor(TEXT_LIMIT / activeDocs.length))}`
+      ).join('\n\n---\n\n');
+
+      const prompt = `Compare these ${activeDocs.length} technical documents.
+User goal: "${goal || 'general comparison'}"
+
+${docsPayload}
+
+Return ONLY valid JSON with no markdown:
+{
+  "recommendation": {
+    "doc": "exact document name",
+    "reason": "2-3 sentence explanation"
+  },
+  "table": [
+    { "attribute": "Summary",       "values": ["summary for doc1", "summary for doc2"] },
+    { "attribute": "Tools Used",    "values": ["tools in doc1", "tools in doc2"] },
+    { "attribute": "Methodology",   "values": ["method in doc1", "method in doc2"] },
+    { "attribute": "Key Findings",  "values": ["findings in doc1", "findings in doc2"] },
+    { "attribute": "Best For",      "values": ["best use case for doc1", "best use case for doc2"] }
+  ]
+}`;
+      const raw  = await callGemini(prompt, apiKey);
+      const data = parseGeminiJSON(raw);
+      setCompareData(data);
+    } catch (err) {
+      showToast && showToast(err.message);
+    } finally {
+      setLoading('');
+    }
+  }, [activeDocs, apiKey, goal]);
+
+  const copyTable = () => {
+    if (!compareData) return;
+    const header = ['Attribute', ...activeDocs.map(d => d.name)];
+    const rows   = compareData.table.map(row => [row.attribute, ...row.values]);
+
+    // HTML table (pastes as real table in OneNote, Word, Excel)
+    const htmlRows = [header, ...rows].map(cells =>
+      `<tr>${cells.map((c, i) => i === 0
+        ? `<th style="background:#0f1f1c;color:#fff;padding:6px 12px;text-align:left">${c}</th>`
+        : `<td style="padding:6px 12px;border:1px solid #e2e8f0">${c}</td>`
+      ).join('')}</tr>`
+    ).join('');
+    const htmlTable = `<table style="border-collapse:collapse;font-family:sans-serif;font-size:13px">${htmlRows}</table>`;
+
+    // Plain text fallback (tab-separated)
+    const plainText = [header, ...rows].map(cells => cells.join('\t')).join('\n');
+
+    navigator.clipboard.write([
+      new ClipboardItem({
+        'text/html':  new Blob([htmlTable],  { type: 'text/html'  }),
+        'text/plain': new Blob([plainText], { type: 'text/plain' }),
+      })
+    ]).then(
+      () => showToast && showToast('Table copied — pastes as table in OneNote/Word!'),
+      () => {
+        // Fallback for browsers that don't support write()
+        navigator.clipboard.writeText(plainText).then(
+          () => showToast && showToast('Copied as plain text'),
+          () => showToast && showToast('Copy failed — try again')
+        );
+      }
+    );
+  };
+
+  if (activeDocs.length < 2) return (
+    <div className="h-full flex items-center justify-center">
+      <div className="text-center text-gray-400 max-w-sm">
+        <div className="text-4xl mb-3">⚖</div>
+        <p className="text-gray-500 font-medium">Activate at least 2 documents</p>
+        <p className="text-sm mt-1 text-gray-400">Check the boxes next to documents in the sidebar.</p>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="h-full flex flex-col">
+      {/* Goal input + controls */}
+      <div className="flex items-center gap-3 px-4 py-3 bg-white border-b border-gray-200 flex-shrink-0">
+        <input
+          type="text"
+          value={goal}
+          onChange={e => setGoal(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') generate(); }}
+          placeholder="What are you looking for? (e.g. structural fatigue analysis)"
+          className="flex-1 border border-gray-200 rounded px-3 py-1.5 text-sm outline-none focus:ring-1 focus:ring-primary"
+        />
+        <button
+          onClick={generate}
+          disabled={!!loading}
+          className="px-4 py-1.5 bg-primary text-white text-sm rounded hover:bg-primary-dark disabled:opacity-50 transition-colors"
+        >Compare</button>
+        {compareData && (
+          <button
+            onClick={copyTable}
+            className="px-3 py-1.5 bg-primary-light text-primary text-sm rounded border border-primary/30 hover:bg-primary hover:text-white transition-colors"
+          >📋 Copy</button>
+        )}
+      </div>
+
+      {/* Content area */}
+      <div className="flex-1 overflow-y-auto p-4">
+        {loading ? (
+          <div className="flex items-center justify-center h-40 text-gray-400">
+            <div className="text-center">
+              <div className="animate-spin text-2xl mb-2">⚙</div>
+              <p>{loading}</p>
+            </div>
+          </div>
+        ) : compareData ? (
+          <div className="max-w-5xl mx-auto space-y-4">
+            {/* Recommendation card */}
+            <div className="bg-primary/10 border border-primary/30 rounded-xl p-4">
+              <div className="text-xs font-semibold text-primary uppercase tracking-wide mb-1">AI Recommendation</div>
+              <div className="text-sm font-medium text-gray-800">
+                Best match: <span className="text-primary font-semibold">{compareData.recommendation.doc}</span>
+              </div>
+              <div className="text-sm text-gray-600 mt-1">{compareData.recommendation.reason}</div>
+            </div>
+
+            {/* Comparison table */}
+            <div className="bg-white rounded-xl shadow-sm overflow-hidden border border-gray-200">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-sidebar text-white">
+                    <th className="text-left px-4 py-3 font-medium w-36">Attribute</th>
+                    {activeDocs.map((d, i) => (
+                      <th key={i} className="text-left px-4 py-3 font-medium">{d.name}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {compareData.table.map((row, i) => (
+                    <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                      <td className="px-4 py-3 font-medium text-primary text-xs uppercase tracking-wide border-r border-gray-100">
+                        {row.attribute}
+                      </td>
+                      {row.values.map((val, j) => (
+                        <td key={j} className="px-4 py-3 text-gray-700 align-top border-r border-gray-100 last:border-r-0">
+                          {val}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center justify-center h-40 text-gray-400">
+            <p>Enter your goal above and click Compare</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+    // ── NEURAL MAP ────────────────────────────────────────────
+    function NeuralMap({ doc, apiKey, graphData, setGraphData, loading, setLoading, setSvgEl, showToast }) {
+      const svgRef     = useRef(null);
+      const zoomRef    = useRef(null);
+      const fitRef     = useRef(null);
+
+      const generateGraph = useCallback(async () => {
+        if (!doc || !apiKey) return;
+        setGraphData(null);
+        setLoading('Generating Neural Map…');
+        try {
+          const prompt = `Analyze this document and create a hierarchical mind map.
+Return ONLY valid JSON with no markdown fences.
+
+Document: ${doc.name}
+Content: ${doc.text.slice(0, TEXT_LIMIT)}
+
+Return this exact structure:
+{
+  "name": "Main Topic (short, 4-6 words)",
+  "children": [
+    {
+      "name": "Category 1",
+      "children": [
+        { "name": "Subtopic 1.1", "children": [] },
+        { "name": "Subtopic 1.2", "children": [] }
+      ]
+    },
+    {
+      "name": "Category 2",
+      "children": [
+        { "name": "Subtopic 2.1", "children": [] }
+      ]
+    }
+  ]
+}
+
+Rules:
+- Maximum 4 top-level categories
+- Maximum 4 children per node
+- Maximum 3 levels deep (root → category → subtopic → detail)
+- Keep node names SHORT: 2-6 words
+- Cover: main topic, methodology, key findings, tools/parameters, results`;
+          let res, data;
+          for (let attempt = 0; attempt <= 2; attempt++) {
+            res = await fetch(`${GEMINI_ENDPOINT}?key=${apiKey}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: { temperature: 0.2, maxOutputTokens: 8192 },
+              }),
+            });
+            if ((res.status === 503 || res.status === 429) && attempt < 2) {
+              await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+              continue;
+            }
+            if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(formatApiError(e.error?.message || `HTTP ${res.status}`)); }
+            data = await res.json();
+            break;
+          }
+          const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+          const tree = parseGeminiJSON(raw);
+          setGraphData(tree);
+        } catch (err) {
+          showToast && showToast(err.message);
+        } finally {
+          setLoading('');
+        }
+      }, [doc, apiKey]);
+
+      // Auto-generate when doc changes and we have a key
+      useEffect(() => {
+        if (doc && apiKey && !graphData) generateGraph();
+      }, [doc?.id]);
+
+      // D3 render
+      useEffect(() => {
+        if (!graphData || !svgRef.current) return;
+        const svgEl = svgRef.current;
+        const svg = d3.select(svgEl);
+        svg.selectAll('*').remove();
+
+        const width  = svgEl.clientWidth  || 900;
+        const height = svgEl.clientHeight || 500;
+
+        const g = svg.append('g');
+
+        // Zoom + pan
+        const zoom = d3.zoom().scaleExtent([0.2, 4]).on('zoom', e => g.attr('transform', e.transform));
+        zoomRef.current = zoom;
+        svg.call(zoom);
+
+        const root = d3.hierarchy(graphData);
+        const treeLayout = d3.tree().nodeSize([50, 260]);
+        treeLayout(root);
+
+        // Center vertically
+        const nodes = root.descendants();
+        const minY = d3.min(nodes, d => d.x);
+        const maxY = d3.max(nodes, d => d.x);
+        const offsetX = 60;
+        const offsetY = height / 2 - (minY + maxY) / 2;
+
+        // Links
+        g.selectAll('.link')
+          .data(root.links())
+          .join('path')
+          .attr('class', 'link')
+          .attr('fill', 'none')
+          .attr('stroke', '#cbd5e1')
+          .attr('stroke-width', 1.5)
+          .attr('d', d3.linkHorizontal()
+            .x(d => d.y + offsetX)
+            .y(d => d.x + offsetY)
+          );
+
+        // Node groups
+        const node = g.selectAll('.node')
+          .data(nodes)
+          .join('g')
+          .attr('class', 'node')
+          .attr('transform', d => `translate(${d.y + offsetX},${d.x + offsetY})`);
+
+        // Node box dimensions — wide enough for text
+        const getBoxWidth = (d) => {
+          const chars = d.data.name.length;
+          const depth = d.depth;
+          const base = depth === 0 ? 200 : depth === 1 ? 175 : 155;
+          return Math.max(base, chars * 7.5);
+        };
+        const boxH = 36;
+
+        // Colors by depth
+        const depthColors = ['#0d9488', '#0f766e', '#1e40af', '#374151'];
+        const textColors  = ['#ffffff', '#ffffff', '#ffffff', '#f9fafb'];
+
+        node.append('rect')
+          .attr('x', d => -getBoxWidth(d) / 2)
+          .attr('y', -boxH / 2)
+          .attr('width', d => getBoxWidth(d))
+          .attr('height', boxH)
+          .attr('rx', 6)
+          .attr('fill', d => depthColors[Math.min(d.depth, 3)])
+          .attr('stroke', '#e2e8f0')
+          .attr('stroke-width', 1);
+
+        node.append('text')
+          .attr('text-anchor', 'middle')
+          .attr('dominant-baseline', 'central')
+          .attr('fill', d => textColors[Math.min(d.depth, 3)])
+          .attr('font-size', d => d.depth === 0 ? '12px' : '11px')
+          .attr('font-weight', d => d.depth <= 1 ? '600' : '400')
+          .each(function(d) {
+            const el = d3.select(this);
+            const words = d.data.name.split(' ');
+            // Simple word wrap: split into 2 lines max
+            const midpoint = Math.ceil(words.length / 2);
+            if (words.length > 3 && d.depth > 0) {
+              el.append('tspan').attr('x', 0).attr('dy', '-0.6em').text(words.slice(0, midpoint).join(' '));
+              el.append('tspan').attr('x', 0).attr('dy', '1.2em').text(words.slice(midpoint).join(' '));
+            } else {
+              el.text(d.data.name);
+            }
+          });
+
+        // Initial zoom to fit
+        const bbox = g.node().getBBox();
+        const scale = Math.min(0.9, Math.min(width / (bbox.width + 80), height / (bbox.height + 80)));
+        const tx = (width - bbox.width * scale) / 2 - bbox.x * scale;
+        const ty = (height - bbox.height * scale) / 2 - bbox.y * scale;
+        fitRef.current = { tx, ty, scale };
+        svg.call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+
+      }, [graphData]);
+
+      // Pass SVG element up for export
+      const svgRefCallback = useCallback(node => {
+        svgRef.current = node;
+        if (setSvgEl) setSvgEl(node); // pass null through to clear stale ref on unmount
+      }, [setSvgEl]);
+
+      if (!doc) return (
+        <div className="h-full flex items-center justify-center text-gray-500">
+          <p>Select a document to generate its Neural Map</p>
+        </div>
+      );
+
+      if (!apiKey) return (
+        <div className="h-full flex items-center justify-center text-gray-500">
+          <p>Add your Gemini API key to generate a Neural Map</p>
+        </div>
+      );
+
+      return (
+        <div className="h-full flex flex-col">
+          {/* Toolbar */}
+          <div className="flex items-center justify-between px-4 py-2 bg-white border-b border-gray-200 flex-shrink-0">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium text-gray-600">Neural Map</span>
+              {doc && <span className="text-xs text-gray-400">— {doc.name}</span>}
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => { setGraphData(null); generateGraph(); }}
+                disabled={!!loading}
+                className="px-3 py-1.5 bg-primary-light text-primary text-xs rounded border border-primary/30 hover:bg-primary hover:text-white transition-colors disabled:opacity-50"
+              >↺ Regenerate</button>
+            </div>
+          </div>
+
+          {/* Graph area */}
+          <div className="flex-1 relative overflow-hidden bg-gray-50">
+            {loading ? (
+              <div className="h-full flex items-center justify-center">
+                <div className="text-center text-gray-400">
+                  <div className="text-3xl mb-2 animate-spin">⚙</div>
+                  <p className="text-sm">{loading}</p>
+                </div>
+              </div>
+            ) : graphData ? (
+              <>
+                <svg ref={svgRefCallback} className="w-full h-full" />
+                {/* Zoom controls overlay */}
+                <div className="absolute bottom-4 right-4 flex flex-col gap-1">
+                  <button
+                    onClick={() => { if (svgRef.current && zoomRef.current) d3.select(svgRef.current).transition().duration(200).call(zoomRef.current.scaleBy, 1.35); }}
+                    className="w-8 h-8 bg-white border border-gray-300 rounded shadow text-gray-600 hover:bg-gray-50 font-bold text-lg flex items-center justify-center"
+                  >+</button>
+                  <button
+                    onClick={() => { if (svgRef.current && zoomRef.current) d3.select(svgRef.current).transition().duration(200).call(zoomRef.current.scaleBy, 0.75); }}
+                    className="w-8 h-8 bg-white border border-gray-300 rounded shadow text-gray-600 hover:bg-gray-50 font-bold text-lg flex items-center justify-center"
+                  >−</button>
+                  <button
+                    title="Fit to window"
+                    onClick={() => {
+                      if (svgRef.current && zoomRef.current && fitRef.current) {
+                        const { tx, ty, scale } = fitRef.current;
+                        d3.select(svgRef.current).transition().duration(350).call(
+                          zoomRef.current.transform, d3.zoomIdentity.translate(tx, ty).scale(scale)
+                        );
+                      }
+                    }}
+                    className="w-8 h-8 bg-white border border-gray-300 rounded shadow text-gray-500 hover:bg-gray-50 text-xs font-medium flex items-center justify-center"
+                  >⊡</button>
+                </div>
+              </>
+            ) : (
+              <div className="h-full flex items-center justify-center">
+                <button onClick={generateGraph} className="px-6 py-3 bg-primary text-white rounded-lg hover:bg-primary-dark transition-colors">
+                  Generate Neural Map
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── APP ROOT ─────────────────────────────────────────────────
+    function App() {
+      const [documents, setDocuments]       = useState(() => loadDocsFromStorage());
+      const [selectedDocId, setSelectedDocId] = useState(() => localStorage.getItem('simlens_selected') || null);
+      const [activeTab, setActiveTab]       = useState('lens');
+      const [apiKey, setApiKey]             = useState(() => localStorage.getItem('simlens_api_key') || '');
+      const [messages, setMessages]         = useState([
+        { role: 'assistant', text: 'Welcome to SimLens! Upload simulation-related documents or research papers (PDF, TXT, MD) to begin. I can answer questions about your documents — or anything in general.' }
+      ]);
+      const [chatOpen, setChatOpen]         = useState(false);
+      const [graphData, setGraphData]       = useState(null);
+      const [slidesCache, setSlidesCache]   = useState({});
+      const [compareData, setCompareData]   = useState(null);
+      const [loading, setLoading]           = useState('');
+      const [exportOpen, setExportOpen]     = useState(false);
+      const [neuralSvgEl, setNeuralSvgEl]   = useState(null);
+      const [toast, setToast]               = useState('');
+      const toastTimerRef = useRef(null);
+      const showToast = useCallback((msg) => {
+        setToast(msg);
+        if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = setTimeout(() => setToast(''), 5000);
+      }, []);
+
+      const activeDocs  = documents.filter(d => d.active);
+      const selectedDoc = documents.find(d => d.id === selectedDocId) || activeDocs[0] || null;
+
+      const TABS = [
+        { id: 'lens',    label: '🔍 Lens View'  },
+        { id: 'neural',  label: '🧠 Neural Map' },
+        { id: 'compare', label: '⚖ Compare'    },
+        { id: 'slides',  label: '🎞 Slides'     },
+      ];
+
+      const handleUpload = useCallback(async (file) => {
+        if (documents.length >= MAX_DOCS) return;
+        setLoading('Uploading…');
+        try {
+          const { text, numPages, pdfData } = await extractTextFromFile(file);
+          const newDoc = {
+            id:        generateId(),
+            name:      file.name,
+            text,
+            numPages,
+            pdfData,
+            fileType:  file.name.toLowerCase().endsWith('.pdf') ? 'PDF'
+                       : file.name.toLowerCase().endsWith('.md') ? 'MD' : 'TXT',
+            active:    true,
+            extracted: null,
+          };
+          setDocuments(prev => [...prev, newDoc]);
+          setSelectedDocId(newDoc.id);
+          setActiveTab('lens');
+          // Persist PDF binary to IndexedDB (no size limit)
+          if (pdfData) idbSavePdf(newDoc.id, pdfData).catch(() => {});
+          // Auto-extract in background — don't block upload
+          if (apiKey) {
+            runAutoExtraction(newDoc, apiKey)
+              .then(extracted => {
+                setDocuments(prev => prev.map(d =>
+                  d.id === newDoc.id ? { ...d, extracted } : d
+                ));
+              })
+              .catch(() => {
+                setDocuments(prev => prev.map(d =>
+                  d.id === newDoc.id ? { ...d, extracted: false } : d
+                ));
+              });
+          }
+        } catch (err) {
+          showToast('Could not read file: ' + err.message);
+        } finally {
+          setLoading('');
+        }
+      }, [documents.length]);
+
+      const chatInputRef  = useRef(null);
+      const chatBottomRef = useRef(null);
+
+      const toggleDocActive = useCallback((id) => {
+        setDocuments(prev => prev.map(d => d.id === id ? { ...d, active: !d.active } : d));
+      }, []);
+
+      const deleteDoc = useCallback((id) => {
+        setDocuments(prev => prev.filter(d => d.id !== id));
+        setSelectedDocId(prev => prev === id ? null : prev);
+        idbDeletePdf(id).catch(() => {});
+      }, []);
+
+      const sendMessage = useCallback(async (text) => {
+        if (!text.trim()) return;
+        const userMsg = { role: 'user', text: text.trim() };
+        setMessages(prev => [...prev, userMsg]);
+        setChatOpen(true);
+        if (chatInputRef.current) chatInputRef.current.value = '';
+
+        if (!apiKey) {
+          setMessages(prev => [...prev, {
+            role: 'assistant',
+            text: '⚠️ Please add your Gemini API key first (click the 🔴 pill in the header).'
+          }]);
+          return;
+        }
+
+        setMessages(prev => [...prev, { role: 'assistant', text: '', loading: true }]);
+
+        const docsContext = activeDocs.length > 0
+          ? activeDocs.map(d =>
+              `=== ${d.name} ===\n${d.text.slice(0, TEXT_LIMIT)}`
+            ).join('\n\n')
+          : '';
+
+        const systemPrompt = `You are SimLens AI, an expert in engineering, simulation, FEA, CFD, and technical analysis.
+${docsContext
+  ? `\nThe user has uploaded these documents:\n${docsContext}\n\nWhen your answer comes from the documents, cite them as [DocumentName, p.N]. If the question is general knowledge, answer without forced citations.`
+  : '\nNo documents are currently uploaded. Answer from general knowledge.'
+}
+
+User question: ${text.trim()}`;
+
+        try {
+          const response = await callGemini(systemPrompt, apiKey);
+          setMessages(prev => [
+            ...prev.slice(0, -1),
+            { role: 'assistant', text: response }
+          ]);
+        } catch (err) {
+          setMessages(prev => [
+            ...prev.slice(0, -1),
+            { role: 'assistant', text: `❌ Error: ${err.message}` }
+          ]);
+        }
+      }, [apiKey, activeDocs]);
+
+      useEffect(() => {
+        chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, [messages]);
+
+      useEffect(() => {
+        setGraphData(null);
+        setCompareData(null);
+      }, [selectedDocId]);
+
+      // Auto-extract any documents that are missing extraction (e.g. restored after failure or fresh load)
+      useEffect(() => {
+        if (!apiKey) return;
+        const pending = documents.filter(d => d.extracted === null);
+        if (pending.length === 0) return;
+        // Extract one at a time (sequential) to avoid quota spikes
+        pending.slice(0, 1).forEach(doc => {
+          runAutoExtraction(doc, apiKey)
+            .then(extracted => setDocuments(prev => prev.map(d => d.id === doc.id ? { ...d, extracted } : d)))
+            .catch(e => {
+              setDocuments(prev => prev.map(d => d.id === doc.id ? { ...d, extracted: false } : d));
+              showToast(e.message || 'Could not extract insights');
+            });
+        });
+      }, [apiKey, documents.filter(d => d.extracted === null).map(d => d.id).join(',')]);
+
+      // Persist documents and selection to localStorage on every change
+      // On mount: load PDF binaries from IndexedDB for docs that lack them (post-refresh)
+      useEffect(() => {
+        documents.filter(d => d.fileType === 'PDF' && !d.pdfData).forEach(async d => {
+          const buf = await idbLoadPdf(d.id);
+          if (buf) setDocuments(prev => prev.map(doc => doc.id === d.id ? { ...doc, pdfData: buf } : doc));
+        });
+      }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => { saveDocsToStorage(documents); }, [documents]);
+      useEffect(() => {
+        if (selectedDocId) localStorage.setItem('simlens_selected', selectedDocId);
+        else localStorage.removeItem('simlens_selected');
+      }, [selectedDocId]);
+
+      const renderTab = () => {
+        switch (activeTab) {
+          case 'lens':
+            return (
+              <LensView
+                doc={selectedDoc}
+                apiKey={apiKey}
+                onQuickAction={(prompt) => { sendMessage(prompt); }}
+                onRetryExtraction={(doc) => {
+                  setDocuments(prev => prev.map(d => d.id === doc.id ? { ...d, extracted: null } : d));
+                  runAutoExtraction(doc, apiKey)
+                    .then(extracted => setDocuments(prev => prev.map(d => d.id === doc.id ? { ...d, extracted } : d)))
+                    .catch(e => {
+                      setDocuments(prev => prev.map(d => d.id === doc.id ? { ...d, extracted: false } : d));
+                      showToast(e.message || 'Could not extract insights');
+                    });
+                }}
+              />
+            );
+          case 'neural':
+            return (
+              <NeuralMap
+                doc={selectedDoc}
+                apiKey={apiKey}
+                graphData={graphData}
+                setGraphData={setGraphData}
+                loading={loading}
+                setLoading={setLoading}
+                setSvgEl={setNeuralSvgEl}
+                showToast={showToast}
+              />
+            );
+          case 'compare':
+            return (
+              <Compare
+                activeDocs={activeDocs}
+                apiKey={apiKey}
+                compareData={compareData}
+                setCompareData={setCompareData}
+                loading={loading}
+                setLoading={setLoading}
+                showToast={showToast}
+              />
+            );
+          case 'slides':
+            return (
+              <Slides
+                activeDocs={activeDocs}
+                apiKey={apiKey}
+                slidesCache={slidesCache}
+                setSlidesCache={setSlidesCache}
+                loading={loading}
+                setLoading={setLoading}
+                showToast={showToast}
+              />
+            );
+          default: return null;
+        }
+      };
+
+      return (
+        <div className="h-screen flex flex-col overflow-hidden">
+          {/* ── HEADER ── */}
+          <header className="flex items-center gap-4 bg-sidebar px-4 py-2 flex-shrink-0">
+            {/* Logo */}
+            <div className="flex items-center gap-2 mr-4">
+              <div className="w-8 h-8 bg-primary rounded flex items-center justify-center text-white font-bold text-sm select-none">SL</div>
+              <div>
+                <div className="text-white font-semibold text-sm leading-tight">SimLens</div>
+                <div className="text-xs text-gray-400 leading-tight">Simulation Research Terminal</div>
+              </div>
+            </div>
+
+            {/* Tabs */}
+            <nav className="flex gap-1 flex-1">
+              {TABS.map(tab => (
+                <button
+                  key={tab.id}
+                  onClick={() => { setActiveTab(tab.id); setExportOpen(false); }}
+                  className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
+                    activeTab === tab.id
+                      ? 'bg-primary text-white'
+                      : 'text-gray-400 hover:text-white hover:bg-sidebar-card'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </nav>
+
+            {/* Right: Export + API Key + Chat toggle */}
+            <div className="flex items-center gap-2">
+              <ExportButton
+                activeTab={activeTab}
+                selectedDoc={selectedDoc}
+                neuralSvgEl={neuralSvgEl}
+                activeDocs={activeDocs}
+                slidesCache={slidesCache}
+                compareData={compareData}
+                exportOpen={exportOpen}
+                setExportOpen={setExportOpen}
+                showToast={showToast}
+              />
+              <ApiKeyPill
+                apiKey={apiKey}
+                onSave={(key) => {
+                  setApiKey(key);
+                  localStorage.setItem('simlens_api_key', key);
+                }}
+              />
+            </div>
+          </header>
+
+          {loading && (
+            <div className="bg-primary text-white text-xs text-center py-1.5 px-4 flex items-center justify-center gap-2 flex-shrink-0">
+              <span className="animate-spin">⚙</span>
+              <span>{loading}</span>
+            </div>
+          )}
+
+          {/* ── BODY: Sidebar + Main ── */}
+          <div className="flex flex-1 overflow-hidden">
+            {/* Sidebar */}
+            <aside className="w-52 bg-sidebar flex flex-col flex-shrink-0 border-r border-sidebar-border">
+              {/* Upload area */}
+              <div className="p-3">
+                <label
+                  className={`block border-2 border-dashed rounded-lg p-4 text-center cursor-pointer transition-colors ${
+                    documents.length >= MAX_DOCS
+                      ? 'border-gray-700 opacity-50 cursor-not-allowed'
+                      : 'border-sidebar-border hover:border-primary'
+                  }`}
+                  onDragOver={e => e.preventDefault()}
+                  onDrop={async e => {
+                    e.preventDefault();
+                    if (documents.length >= MAX_DOCS) return;
+                    const file = e.dataTransfer.files[0];
+                    if (file) await handleUpload(file);
+                  }}
+                >
+                  <input
+                    type="file"
+                    accept=".pdf,.txt,.md"
+                    className="hidden"
+                    disabled={documents.length >= MAX_DOCS}
+                    onChange={async e => {
+                      const file = e.target.files[0];
+                      if (file) { await handleUpload(file); e.target.value = ''; }
+                    }}
+                  />
+                  <div className="text-3xl mb-1">📂</div>
+                  <div className="text-xs font-semibold text-gray-300">
+                    {documents.length >= MAX_DOCS ? `Limit reached (${MAX_DOCS})` : 'Drop files here'}
+                  </div>
+                  <div className="text-xs text-gray-500 mt-0.5">
+                    {documents.length >= MAX_DOCS ? '' : 'or click to browse'}
+                  </div>
+                  <div className="text-xs text-gray-600 mt-1">PDF · TXT · MD (max {MAX_DOCS})</div>
+                </label>
+              </div>
+
+              {/* Doc list */}
+              <div className="flex-1 overflow-y-auto px-3 pb-3">
+                <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">
+                  Active Context {activeDocs.length}/{documents.length}
+                </div>
+                {documents.length === 0 && (
+                  <p className="text-xs text-gray-600 italic">No documents yet</p>
+                )}
+                {documents.map(doc => (
+                  <div
+                    key={doc.id}
+                    onClick={() => setSelectedDocId(doc.id)}
+                    className={`flex items-center gap-2 p-2 rounded-lg mb-1 cursor-pointer group transition-colors ${
+                      selectedDocId === doc.id ? 'bg-primary/20 border border-primary/40' : 'hover:bg-sidebar-card'
+                    }`}
+                  >
+                    {/* Active toggle */}
+                    <button
+                      onClick={e => { e.stopPropagation(); toggleDocActive(doc.id); }}
+                      className="flex-shrink-0"
+                    >
+                      <span className={`w-4 h-4 rounded flex items-center justify-center text-xs border ${
+                        doc.active ? 'bg-primary border-primary text-white' : 'border-gray-600 text-transparent'
+                      }`}>✓</span>
+                    </button>
+                    {/* Info */}
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs text-gray-300 truncate">{doc.name}</div>
+                      <div className="text-xs text-gray-500 flex items-center gap-1">
+                        <span>{doc.numPages}p · {doc.fileType}</span>
+                        {doc.extracted === null && apiKey && (
+                          <span className="inline-block w-1.5 h-1.5 rounded-full bg-yellow-400 animate-pulse ml-1" title="Analyzing…"></span>
+                        )}
+                        {doc.extracted && (
+                          <span className="text-primary">· ✓</span>
+                        )}
+                      </div>
+                    </div>
+                    {/* Delete */}
+                    <button
+                      onClick={e => { e.stopPropagation(); deleteDoc(doc.id); }}
+                      className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400 text-xs flex-shrink-0"
+                      title="Remove"
+                    >✕</button>
+                  </div>
+                ))}
+              </div>
+            </aside>
+
+            {/* Main content */}
+            <main className="flex-1 overflow-hidden bg-primary-light flex flex-col">
+              {selectedDoc || (activeTab === 'compare' && activeDocs.length >= 2) ? renderTab() : (
+                <div className="h-full flex items-center justify-center">
+                  <div className="text-center text-gray-400">
+                    <div className="text-5xl mb-3">📄</div>
+                    <p className="text-lg font-medium text-gray-500">Upload a document to get started</p>
+                    <p className="text-sm mt-1">Supports PDF, TXT, and Markdown files</p>
+                  </div>
+                </div>
+              )}
+            </main>
+
+            {/* ── RIGHT CHAT PANEL ── */}
+              <div className="w-80 flex-shrink-0 bg-sidebar border-l border-sidebar-border flex flex-col">
+                {/* Panel header */}
+                <div className="flex items-center justify-between px-4 py-2.5 border-b border-sidebar-border flex-shrink-0">
+                  <div className="flex items-center gap-2">
+                    <span className={`w-2 h-2 rounded-full ${apiKey ? 'bg-green-400' : 'bg-red-500'}`}></span>
+                    <span className="text-sm font-medium text-gray-300">AI Assistant</span>
+                  </div>
+                </div>
+                {/* Messages */}
+                <div className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
+                  {messages.map((msg, i) => (
+                    <div key={i} className={`flex gap-2 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
+                      <div className={`w-6 h-6 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold ${msg.role === 'user' ? 'bg-gray-600 text-gray-200' : 'bg-primary text-white'}`}>
+                        {msg.role === 'user' ? 'U' : 'AI'}
+                      </div>
+                      <div
+                        className={`chat-md px-3 py-2 rounded-2xl text-xs leading-relaxed ${msg.role === 'user' ? 'bg-gray-700 text-gray-100 rounded-tr-sm' : 'bg-sidebar-card text-gray-200 rounded-tl-sm'}`}
+                        style={{maxWidth: '85%'}}
+                        dangerouslySetInnerHTML={msg.loading ? undefined : { __html: renderMarkdown(msg.text) }}
+                      >
+                        {msg.loading && <span className="inline-block animate-pulse ml-1">▋</span>}
+                      </div>
+                    </div>
+                  ))}
+                  <div ref={chatBottomRef} />
+                </div>
+                {/* Input */}
+                <div className="flex-shrink-0 border-t border-sidebar-border px-3 py-2">
+                  <div className="flex gap-2">
+                    <input
+                      ref={chatInputRef}
+                      type="text"
+                      placeholder="Ask about your documents…"
+                      className="flex-1 bg-sidebar-card text-gray-200 placeholder-gray-500 rounded px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-primary min-w-0"
+                      onKeyDown={e => { if (e.key === 'Enter') sendMessage(e.currentTarget.value); }}
+                    />
+                    <button
+                      onClick={() => sendMessage(chatInputRef.current?.value || '')}
+                      className="bg-primary text-white px-3 py-2 rounded text-xs font-medium hover:bg-primary-dark transition-colors flex-shrink-0"
+                    >↑</button>
+                  </div>
+                </div>
+              </div>
+          </div>
+
+          {/* Toast notification */}
+          {toast && (
+            <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-gray-900 text-white text-sm px-5 py-2.5 rounded-full shadow-xl pointer-events-none animate-fade-in">
+              {toast}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
